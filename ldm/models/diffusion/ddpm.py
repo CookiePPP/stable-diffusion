@@ -5,11 +5,14 @@ https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bb
 https://github.com/CompVis/taming-transformers
 -- merci
 """
+import gc
 
 import torch
 import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
+from fairscale.nn import auto_wrap
+from pytorch_lightning.utilities.seed import isolate_rng, seed_everything
 from torch.optim.lr_scheduler import LambdaLR
 from einops import rearrange, repeat
 from contextlib import contextmanager
@@ -51,6 +54,7 @@ class DDPM(pl.LightningModule):
                  ckpt_path=None,
                  ignore_keys=[],
                  load_only_unet=False,
+                 unet_trainable=True,
                  monitor="val/loss",
                  use_ema=True,
                  first_stage_key="image",
@@ -85,11 +89,18 @@ class DDPM(pl.LightningModule):
         self.use_positional_encodings = use_positional_encodings
         self.model = DiffusionWrapper(unet_config, conditioning_key)
         count_params(self.model, verbose=True)
+        
+        self.unet_trainable = unet_trainable
         self.use_ema = use_ema
-        if self.use_ema:
-            self.model_ema = LitEma(self.model)
-            print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
-
+        self.ema_is_replacing_main_weights = False
+        if self.use_ema and self.unet_trainable:
+            self.model_ema = LitEma(
+                self.model,
+                rank=self.global_rank,
+                half_life=12000//8,  # 12k steps with gradient accumulation of 8
+            )
+            print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))} parameter tensors.")
+        
         self.use_scheduler = scheduler_config is not None
         if self.use_scheduler:
             self.scheduler_config = scheduler_config
@@ -113,7 +124,10 @@ class DDPM(pl.LightningModule):
         if self.learn_logvar:
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
 
-
+    def configure_sharded_model(self) -> None:
+        #self.model = auto_wrap(self.model)
+        raise NotImplementedError('Sharded model without first_stage/cond_stage not implemented yet.')
+    
     def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
         if exists(given_betas):
@@ -171,18 +185,55 @@ class DDPM(pl.LightningModule):
     @contextmanager
     def ema_scope(self, context=None):
         if self.use_ema:
-            self.model_ema.store(self.model.parameters())
-            self.model_ema.copy_to(self.model)
+            self.load_ema()
             if context is not None:
                 print(f"{context}: Switched to EMA weights")
         try:
             yield None
         finally:
             if self.use_ema:
-                self.model_ema.restore(self.model.parameters())
+                self.unload_ema()
                 if context is not None:
                     print(f"{context}: Restored training weights")
-
+    
+    def load_ema(self):
+        if self.ema_is_replacing_main_weights:
+            return
+        self.model_ema.swap_state(self.model) # swap weights and shadow weights
+        self.ema_is_replacing_main_weights = True
+    
+    def unload_ema(self):
+        if self.ema_is_replacing_main_weights is False:
+            return
+        self.model_ema.swap_state(self.model) # swap weights and shadow weights back to original order
+        self.ema_is_replacing_main_weights = False
+        # garbage collection since RAM is limited
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    def on_train_start(self) -> None: # THIS IS ESSENTIAL FOR EMA VRAM USAGE
+        if hasattr(self, 'model_ema'):
+            self.model_ema.to(self.model_ema.device)
+        # garbage collection since RAM is limited
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        self.trainer.train_dataloader.sampler.set_epoch(self.current_epoch)
+    
+    def on_validation_epoch_start(self) -> None:
+        if hasattr(self, 'model_ema'):
+            self.model_ema.to(self.model_ema.device)
+        # garbage collection since RAM is limited
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    def on_validation_epoch_end(self) -> None:
+        if hasattr(self, 'model_ema'):
+            self.model_ema.to(self.model_ema.device)
+        # garbage collection since RAM is limited
+        gc.collect()
+        torch.cuda.empty_cache()
+    
     def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
         sd = torch.load(path, map_location="cpu")
         if "state_dict" in list(sd.keys()):
@@ -340,6 +391,8 @@ class DDPM(pl.LightningModule):
         return loss, loss_dict
 
     def training_step(self, batch, batch_idx):
+        self.unload_ema()
+        
         loss, loss_dict = self.shared_step(batch)
 
         self.log_dict(loss_dict, prog_bar=True,
@@ -347,25 +400,38 @@ class DDPM(pl.LightningModule):
 
         self.log("global_step", self.global_step,
                  prog_bar=True, logger=True, on_step=True, on_epoch=False)
-
+        
         if self.use_scheduler:
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
         return loss
-
+    
     @torch.no_grad()
-    def validation_step(self, batch, batch_idx):
-        _, loss_dict_no_ema = self.shared_step(batch)
-        with self.ema_scope():
-            _, loss_dict_ema = self.shared_step(batch)
-            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
-        self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+    def validation_step(self, batch, batch_idx, dataloader_idx):
+        if dataloader_idx == 0:
+            self.unload_ema()
+            postfix = ''
+        elif dataloader_idx == 1:
+            self.load_ema()
+            postfix = '_ema'
+        else:
+            raise NotImplementedError(f"Unexpected dataloader index {dataloader_idx}")
+        
+        with isolate_rng(): # isolate rng for each validation step
+            seed_everything(batch_idx) # for reproducibility of validation
+            _, loss_dict = self.shared_step(batch)
+            loss_dict = {f'{key}{postfix}': loss_dict[key] for key in loss_dict}
+            self.log_dict(loss_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
 
-    def on_train_batch_end(self, *args, **kwargs):
-        if self.use_ema:
+    def optimizer_step(self, *args, **kwargs):
+        _ = super().optimizer_step(*args, **kwargs)
+        if self.use_ema and hasattr(self, 'model_ema'):
+            if self.ema_is_replacing_main_weights:
+                print("WARNING: Trying to update cond EMA weights while they're in the main model!")
+            self.model_ema.rank = self.global_rank
             self.model_ema(self.model)
+        return _
 
     def _get_rows_from_list(self, samples):
         n_imgs_per_row = len(samples)
@@ -414,7 +480,9 @@ class DDPM(pl.LightningModule):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
+        params = []
+        if self.unet_trainable:
+            params = params + list(self.model.parameters())
         if self.learn_logvar:
             params = params + [self.logvar]
         opt = torch.optim.AdamW(params, lr=lr)
@@ -429,6 +497,7 @@ class LatentDiffusion(DDPM):
                  num_timesteps_cond=None,
                  cond_stage_key="image",
                  cond_stage_trainable=False,
+                 first_stage_trainable=False,
                  concat_mode=True,
                  cond_stage_forward=None,
                  conditioning_key=None,
@@ -448,6 +517,7 @@ class LatentDiffusion(DDPM):
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
+        self.first_stage_trainable = first_stage_trainable
         self.cond_stage_key = cond_stage_key
         try:
             self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
@@ -462,12 +532,47 @@ class LatentDiffusion(DDPM):
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
-
+        
+        if self.use_ema and self.cond_stage_trainable:
+            self.cond_stage_model_ema = LitEma(
+                self.cond_stage_model,
+                rank=self.model_ema.rank,
+                half_life=self.model_ema.half_life,
+            )
+        
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
-
+    
+    def get_dtype(self):
+        return next(self.model.parameters()).dtype
+    
+    def configure_sharded_model(self) -> None:
+        self.first_stage_model = auto_wrap(self.first_stage_model)
+        self.cond_stage_model = auto_wrap(self.cond_stage_model)
+        self.model = auto_wrap(self.model)
+        
+    def load_ema(self, *args, **kwargs):
+        if self.ema_is_replacing_main_weights:
+            return
+        
+        if hasattr(self, "cond_stage_model_ema"):
+            self.cond_stage_model_ema.swap_state(self.cond_stage_model)  # swap weights and shadow weights
+        _ = super().load_ema(*args, **kwargs)
+        self.ema_is_replacing_main_weights = True
+        return _
+    
+    def unload_ema(self, *args, **kwargs):
+        if self.ema_is_replacing_main_weights is False:
+            return
+        
+        if hasattr(self, "cond_stage_model_ema"):
+            self.cond_stage_model_ema.swap_state(self.cond_stage_model)  # swap weights and shadow weights back to original order
+        _ = super().unload_ema(*args, **kwargs)
+        self.ema_is_replacing_main_weights = False
+        return _
+    
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
         ids = torch.round(torch.linspace(0, self.num_timesteps - 1, self.num_timesteps_cond)).long()
@@ -501,10 +606,17 @@ class LatentDiffusion(DDPM):
 
     def instantiate_first_stage(self, config):
         model = instantiate_from_config(config)
-        self.first_stage_model = model.eval()
-        self.first_stage_model.train = disabled_train
-        for param in self.first_stage_model.parameters():
-            param.requires_grad = False
+        print("first stage model instantiated")
+        
+        if not self.first_stage_trainable:
+            self.first_stage_model = model.eval()
+            self.first_stage_model.train = disabled_train
+        else:
+            self.first_stage_model = model
+        
+        if self.first_stage_model is not None:
+            for param in self.first_stage_model.parameters():
+                param.requires_grad = self.first_stage_trainable
 
     def instantiate_cond_stage(self, config):
         if not self.cond_stage_trainable:
@@ -519,13 +631,15 @@ class LatentDiffusion(DDPM):
                 model = instantiate_from_config(config)
                 self.cond_stage_model = model.eval()
                 self.cond_stage_model.train = disabled_train
-                for param in self.cond_stage_model.parameters():
-                    param.requires_grad = False
         else:
             assert config != '__is_first_stage__'
             assert config != '__is_unconditional__'
             model = instantiate_from_config(config)
-            self.cond_stage_model = model
+            self.cond_stage_model = model.eval()
+        
+        if self.cond_stage_model is not None:
+            for param in self.cond_stage_model.parameters():
+                param.requires_grad = self.cond_stage_trainable
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
         denoise_row = []
@@ -656,7 +770,7 @@ class LatentDiffusion(DDPM):
         x = super().get_input(batch, k)
         if bs is not None:
             x = x[:bs]
-        x = x.to(self.device)
+        x = x.to(device=self.device, dtype=self.get_dtype())
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
@@ -866,9 +980,30 @@ class LatentDiffusion(DDPM):
         x, c = self.get_input(batch, self.first_stage_key)
         loss = self(x, c)
         return loss
-
+    
+    def get_evenly_spaced_t(self, B):
+        """
+        Rather than completely randomly sampling timesteps for training,
+        Sample timesteps even spaced so no timestep is skipped or repeated.
+        Smoothens the loss curve and improves training stability.
+        
+        Returns: [B] tensor of noise ints in [0, self.num_timesteps]
+        """
+        # Get a random t value
+        t = torch.randint(0, self.num_timesteps, (1,), device=self.device).long()
+        
+        # Sample B evenly spaced values in [0, self.num_timesteps] using t as the starting point
+        # e.g: with B=4, t=3, num_timesteps=8, we get [3, 5, 7, 1]
+        bt = torch.zeros(B, dtype=torch.long)
+        bt[0] = t
+        timestep_interval = self.num_timesteps // B
+        for b in range(1, B):
+            bt[b] = (bt[b-1] + timestep_interval) % self.num_timesteps
+        
+        return bt.to(self.device)
+    
     def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        t = self.get_evenly_spaced_t(x.shape[0])
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
@@ -891,7 +1026,7 @@ class LatentDiffusion(DDPM):
     def apply_model(self, x_noisy, t, cond, return_ids=False):
 
         if isinstance(cond, dict):
-            # hybrid case, cond is exptected to be a dict
+            # hybrid case, cond is expected to be a dict
             pass
         else:
             if not isinstance(cond, list):
@@ -1013,7 +1148,7 @@ class LatentDiffusion(DDPM):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_output = self.apply_model(x_noisy, t, cond)
-
+        
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
 
@@ -1248,7 +1383,7 @@ class LatentDiffusion(DDPM):
 
 
     @torch.no_grad()
-    def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
+    def log_images(self, batch, N=8, n_row=1, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
                    plot_diffusion_rows=True, **kwargs):
 
@@ -1360,14 +1495,17 @@ class LatentDiffusion(DDPM):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
+        params = []
+        if self.unet_trainable:
+            params = params + list(self.model.parameters())
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             params = params + list(self.cond_stage_model.parameters())
         if self.learn_logvar:
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)
-        opt = torch.optim.AdamW(params, lr=lr)
+        opt = torch.optim.AdamW(params, lr=lr, weight_decay=1e-6)
+        
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
             scheduler = instantiate_from_config(self.scheduler_config)
@@ -1381,6 +1519,15 @@ class LatentDiffusion(DDPM):
                 }]
             return [opt], scheduler
         return opt
+    
+    def optimizer_step(self, *args, **kwargs):
+        _ = super().optimizer_step(*args, **kwargs)
+        if hasattr(self, "cond_stage_model_ema"):
+            if self.ema_is_replacing_main_weights:
+                print("WARNING: Trying to update cond EMA weights while they're in the main model!")
+            self.cond_stage_model_ema.rank = self.global_rank
+            self.cond_stage_model_ema(self.cond_stage_model)
+        return _
 
     @torch.no_grad()
     def to_rgb(self, x):

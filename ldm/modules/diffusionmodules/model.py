@@ -7,7 +7,7 @@ from einops import rearrange
 
 from ldm.util import instantiate_from_config
 from ldm.modules.attention import LinearAttention
-
+from ldm.modules.diffusionmodules.util import checkpoint
 
 def get_timestep_embedding(timesteps, embedding_dim):
     """
@@ -117,8 +117,9 @@ class ResnetBlock(nn.Module):
                                                     kernel_size=1,
                                                     stride=1,
                                                     padding=0)
+        self.checkpoint = False
 
-    def forward(self, x, temb):
+    def _forward(self, x, temb=None):
         h = x
         h = self.norm1(h)
         h = nonlinearity(h)
@@ -139,6 +140,10 @@ class ResnetBlock(nn.Module):
                 x = self.nin_shortcut(x)
 
         return x+h
+    
+    def forward(self, x, temb):
+        args = (x, temb) if temb is not None else (x,)
+        return checkpoint(self._forward, args, self.parameters(), self.checkpoint)
 
 
 class LinAttnBlock(LinearAttention):
@@ -173,15 +178,15 @@ class AttnBlock(nn.Module):
                                         kernel_size=1,
                                         stride=1,
                                         padding=0)
-
-
-    def forward(self, x):
+        self.checkpoint = False
+    
+    def _forward(self, x):
         h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
+        h_ = self.norm(h_) # b, c, h, w
+        q = self.q(h_) # b, c, h, w
+        k = self.k(h_) # b, c, h, w
+        v = self.v(h_) # b, c, h, w
+        
         # compute attention
         b,c,h,w = q.shape
         q = q.reshape(b,c,h*w)
@@ -200,7 +205,9 @@ class AttnBlock(nn.Module):
         h_ = self.proj_out(h_)
 
         return x+h_
-
+    
+    def forward(self, x):
+        return checkpoint(self._forward, (x,), self.parameters(), self.checkpoint)
 
 def make_attn(in_channels, attn_type="vanilla"):
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
@@ -406,7 +413,7 @@ class Encoder(nn.Module):
             down = nn.Module()
             down.block = block
             down.attn = attn
-            if i_level != self.num_resolutions-1:
+            if i_level != self.num_resolutions-1: # no downsample at last level
                 down.downsample = Downsample(block_in, resamp_with_conv)
                 curr_res = curr_res // 2
             self.down.append(down)
@@ -519,7 +526,7 @@ class Decoder(nn.Module):
             up = nn.Module()
             up.block = block
             up.attn = attn
-            if i_level != 0:
+            if i_level != 0: # no upsample at first level
                 up.upsample = Upsample(block_in, resamp_with_conv)
                 curr_res = curr_res * 2
             self.up.insert(0, up) # prepend to get consistent order

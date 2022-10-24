@@ -213,7 +213,9 @@ class SiLU(nn.Module):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        dtype = next(self.parameters()).dtype
+        return torch.nn.functional.group_norm(
+            x.type(dtype), self.num_groups, self.weight.type(dtype), self.bias.type(dtype), self.eps).to(x.dtype)
 
 def conv_nd(dims, *args, **kwargs):
     """

@@ -1,0 +1,85 @@
+lightning:
+  trainer:
+    log_every_n_steps: 1
+    max_steps: 10000000
+    fast_dev_run: False
+    num_sanity_val_steps: 2 # sanity check the validation before training
+
+    val_check_interval: 1000 # validate every checkpoint before saving
+    limit_val_batches: 50 # validate on 50 batches max (750 images with my setup)
+    accumulate_grad_batches: 16 # accumulate gradients over 4 batches
+    benchmark: True # use cudnn benchmarking to find the fastest convolution algorithms. Should only be used for exactly reproducible experiments, because it can slow down the first epoch.
+  
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 512
+        max_images: 8
+        increase_log_steps: False
+
+model:
+  base_learning_rate: 1e-6
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    use_ema: False
+    monitor: "val/rec_loss"
+    embed_dim: 4
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        kl_weight: 0.000001
+        use_discriminator: False
+        disc_start: 0 # iteration to start using discriminator
+        disc_weight: 0.5
+    
+    ddconfig:
+      in_channels: 3 # RGB
+      out_ch: 3 # RGB
+      double_z: true
+      z_channels: 4 # latent dimension
+      resolution: 256 # this parameter doesn't really do anything
+      ch: 128
+      ch_mult:
+        - 1 # 128dim @ 256x256 (native resolution)
+        - 2 # 256dim @ 128x128
+        - 4 # 512dim @  64x64
+        - 4 # 512dim @  32x32
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size : 2
+    num_workers: 4
+    wrap: false
+    train:
+      target: ldm.data.personalized.PersonalizedBase
+      params:
+        set: train
+        data_root: "/media/cookie/WD6TB/Derpi/dataset_v5/train"
+        tagdata_path: "/media/cookie/WD6TB/Derpi/Derpi/metadata/tagsdata.p"
+        dump_dataset_sample_path: "/media/cookie/WD6TB/Derpi/dataset_v5_sample"
+        size: 256
+        center_crop: false
+        allow_rectangle_batches: false # when enough non-square images are in the batch, allow them to be rectangular
+        max_zoom: 4.0
+        max_image_squash: 0.2
+        use_rotated_images: true
+        use_vertical_flip: true
+    validation:
+      target: ldm.data.personalized.PersonalizedBase
+      params:
+        set: val
+        data_root: "/media/cookie/WD6TB/Derpi/dataset_v5/val"
+        tagdata_path: "/media/cookie/WD6TB/Derpi/Derpi/metadata/tagsdata.p"
+        dump_dataset_sample_path: "/media/cookie/WD6TB/Derpi/dataset_v5_sample"
+        size: 256
+        center_crop: false
+        allow_rectangle_batches: false # when enough non-square images are in the batch, allow them to be rectangular
+        max_zoom: 4.0
+        max_image_squash: 0.2
+        use_rotated_images: true
+        use_vertical_flip: true

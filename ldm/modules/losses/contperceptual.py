@@ -8,8 +8,7 @@ class LPIPSWithDiscriminator(nn.Module):
     def __init__(self, disc_start, logvar_init=0.0, kl_weight=1.0, pixelloss_weight=1.0,
                  disc_num_layers=3, disc_in_channels=3, disc_factor=1.0, disc_weight=1.0,
                  perceptual_weight=1.0, use_actnorm=False, disc_conditional=False,
-                 disc_loss="hinge"):
-
+                 disc_loss="hinge", use_discriminator=True):
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
         self.kl_weight = kl_weight
@@ -18,11 +17,12 @@ class LPIPSWithDiscriminator(nn.Module):
         self.perceptual_weight = perceptual_weight
         # output log variance
         self.logvar = nn.Parameter(torch.ones(size=()) * logvar_init)
-
-        self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
-                                                 n_layers=disc_num_layers,
-                                                 use_actnorm=use_actnorm
-                                                 ).apply(weights_init)
+        
+        self.use_discriminator = use_discriminator
+        if self.use_discriminator:
+            self.discriminator = NLayerDiscriminator(
+                input_nc=disc_in_channels, n_layers=disc_num_layers,
+                use_actnorm=use_actnorm).apply(weights_init)
         self.discriminator_iter_start = disc_start
         self.disc_loss = hinge_d_loss if disc_loss == "hinge" else vanilla_d_loss
         self.disc_factor = disc_factor
@@ -59,8 +59,18 @@ class LPIPSWithDiscriminator(nn.Module):
         kl_loss = posteriors.kl()
         kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
 
+        loss = weighted_nll_loss + self.kl_weight * kl_loss
+
+        log = {
+            "{}/total_loss".format(split): loss.clone().detach().mean(),
+            "{}/logvar".format(split)    : self.logvar.detach(),
+            "{}/kl_loss".format(split)   : kl_loss.detach().mean(),
+            "{}/nll_loss".format(split)  : nll_loss.detach().mean(),
+            "{}/rec_loss".format(split)  : rec_loss.detach().mean(),
+        }
+        
         # now the GAN part
-        if optimizer_idx == 0:
+        if optimizer_idx == 0 and self.discriminator_iter_start and self.use_discriminator:
             # generator update
             if cond is None:
                 assert not self.disc_conditional
@@ -80,18 +90,17 @@ class LPIPSWithDiscriminator(nn.Module):
                 d_weight = torch.tensor(0.0)
 
             disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
-            loss = weighted_nll_loss + self.kl_weight * kl_loss + d_weight * disc_factor * g_loss
-
-            log = {"{}/total_loss".format(split): loss.clone().detach().mean(), "{}/logvar".format(split): self.logvar.detach(),
-                   "{}/kl_loss".format(split): kl_loss.detach().mean(), "{}/nll_loss".format(split): nll_loss.detach().mean(),
-                   "{}/rec_loss".format(split): rec_loss.detach().mean(),
-                   "{}/d_weight".format(split): d_weight.detach(),
-                   "{}/disc_factor".format(split): torch.tensor(disc_factor),
-                   "{}/g_loss".format(split): g_loss.detach().mean(),
-                   }
+            loss = loss + d_weight * disc_factor * g_loss
+            gan_log = {
+               "{}/d_weight".format(split): d_weight.detach(),
+               "{}/disc_factor".format(split): torch.tensor(disc_factor),
+               "{}/g_loss".format(split): g_loss.detach().mean(),
+            }
+            log.update(gan_log)
+            
             return loss, log
-
-        if optimizer_idx == 1:
+        
+        elif optimizer_idx == 1 and self.discriminator_iter_start and self.use_discriminator:
             # second pass for discriminator update
             if cond is None:
                 logits_real = self.discriminator(inputs.contiguous().detach())
@@ -108,4 +117,4 @@ class LPIPSWithDiscriminator(nn.Module):
                    "{}/logits_fake".format(split): logits_fake.detach().mean()
                    }
             return d_loss, log
-
+        return loss, log

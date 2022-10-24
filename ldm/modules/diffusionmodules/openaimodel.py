@@ -7,6 +7,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -707,7 +708,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, gradient_checkpoint=True, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -727,19 +728,28 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb, context)
-            hs.append(h)
-        h = self.middle_block(h, emb, context)
-        for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
-        h = h.type(x.dtype)
+        def identity(func, *args):
+            return func(*args)
+        maybe_cp = grad_checkpoint if gradient_checkpoint else identity
+        
+        h = identity(self.unet_main, context, emb, hs, identity, x)
+        
         if self.predict_codebook_ids:
             return self.id_predictor(h)
         else:
             return self.out(h)
+
+    def unet_main(self, context, emb, hs, identity, x):
+        h = x.type(self.dtype)
+        for module in self.input_blocks:
+            h = identity(module, h, emb, context)
+            hs.append(h)
+        h = identity(self.middle_block, h, emb, context)
+        for module in self.output_blocks:
+            h = th.cat([h, hs.pop()], dim=1)
+            h = identity(module, h, emb, context)
+        h = h.type(x.dtype)
+        return h
 
 
 class EncoderUNetModel(nn.Module):

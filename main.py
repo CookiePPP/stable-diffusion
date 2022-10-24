@@ -1,4 +1,10 @@
 import argparse, os, sys, datetime, glob, importlib, csv
+import math
+import random
+import re
+from copy import deepcopy
+from typing import Iterator, Optional, List, Dict
+
 import numpy as np
 import time
 import torch
@@ -7,6 +13,7 @@ import pytorch_lightning as pl
 
 from packaging import version
 from omegaconf import OmegaConf
+from pytorch_lightning.plugins import DDPPlugin
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
 from PIL import Image
@@ -16,10 +23,11 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.strategies import DeepSpeedStrategy
+from torchvision.transforms import Resize
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
-
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -118,7 +126,19 @@ def get_parser(**parser_kwargs):
         nargs="?",
         const=True,
         default=True,
-        help="scale base-lr by ngpu * batch_size * n_accumulate",
+        help="scale base-lr by sqrt(ngpu * batch_size * n_accumulate)",
+    )
+    parser.add_argument(
+        "--use_ema_weights",
+        action='store_true',
+        help="replace model weights with EMAs",
+    )
+    
+    # storetrue arg for --dated_logdir
+    parser.add_argument(
+        "--dated_logdir",
+        action='store_true',
+        help="add date to logdir",
     )
     return parser
 
@@ -158,16 +178,227 @@ def worker_init_fn(_):
     else:
         return np.random.seed(np.random.get_state()[1][0] + worker_id)
 
+class AspectRatioBucketedCollateFunc:
+    def __init__(self, img_size: int, rectangle_batches: bool, variable_image_size: bool):
+        self.img_size = img_size
+        self.rectangle_batches = rectangle_batches # use non-square images
+        self.variable_image_size = variable_image_size # use variable image sizes (reduce batch size if necessary to fit in memory)
+    
+    def __call__(self, batch: List[Dict]):
+        """
+        Get a list where each element is a dict of form
+        {'image': tensor, 'caption': str}
+        if rectangle_batches:
+            image tensor has shape (w, h, 3)
+        else:
+            image tensor has shape (256, 256, 3)
+        """
+        if self.rectangle_batches:
+            # calculate average aspect ratio of images
+            aspect_ratios = [d['image'].shape[1] / d['image'].shape[0] for d in batch]
+            avg_aspect_ratio = sum(aspect_ratios) / len(aspect_ratios)
+            # limit avg aspect ratio to 4, 1/4
+            avg_aspect_ratio = max(min(avg_aspect_ratio, 4), 1/4)
+            
+            target_pixels = self.img_size ** 2
+            batch_size = len(batch)
+            if self.variable_image_size:
+                # maybe increase image resolution but decrease batch size
+                # (keeping total number of pixels constant)
+                
+                # calc maximum resolution scale factor
+                max_resolution_factor = min(d['image'].shape[0]*d['image'].shape[1]/target_pixels for d in batch)
+                max_resolution_factor = min(max_resolution_factor, 2.0) # limit to 2x total pixels
+                max_resolution_factor = min(max_resolution_factor, batch_size) # ensure at least 1 image per batch
+                
+                log_resolution_factor = random.uniform(math.log2(0.25), math.log2(max_resolution_factor))
+                resolution_factor = 2 ** log_resolution_factor
+                resolution_factor = max(resolution_factor, 1.0)
+                
+                batch_size = int(batch_size / resolution_factor)
+                target_pixels = int(target_pixels * resolution_factor)
+                
+                batch = batch[:batch_size]
+            
+            multiple = 64 # must dims must be multiple of 64 for autoencder
+            # calculate width and height
+            w = round(np.sqrt(target_pixels * avg_aspect_ratio) / multiple) * multiple # calc ideal width
+            h = int(target_pixels / w / multiple) * multiple # then get the largest height that fits
+            w = max(w, multiple)
+            h = max(h, multiple)
+            # resize images
+            for d in batch:
+                # replace d['image'] with trimmed version (so all images in batch have exactly same size and aspect ratio)
+                image = d['image'] # (H, W, 3)
+                H, W, _ = image.shape
+                if W/H > avg_aspect_ratio: # if image is wider than avg
+                    # trim left and right
+                    pad = round(W - H * avg_aspect_ratio) / 2
+                    image = image[:, int(pad):-int(pad) or None] # (H, W, 3) -> (H, H * avg_aspect_ratio, 3)
+                else: # if image is taller than avg
+                    # trim top and bottom
+                    pad = round(H - W / avg_aspect_ratio) // 2
+                    image = image[int(pad):-int(pad) or None, :] # (H, W, 3) -> (W / avg_aspect_ratio, W, 3)
+                # resize using PIL
+                image = Image.fromarray(image.numpy()).resize((w, h), resample=Image.BICUBIC)
+                # convert back to tensor and normalize to [-1, 1]
+                image = np.array(image).astype(np.uint8)
+                d['image'] = torch.from_numpy(image).div(127.5).sub(1) # (H, W, 3)
+            
+            #print("aspect_ratios:", [f'{ar:.02f}' for ar in aspect_ratios])
+            print("resolutions:", [f'{d["image"].shape[1]}x{d["image"].shape[0]}' for d in batch])
+            
+            # collate into batch
+            images = torch.stack([d['image'] for d in batch], dim=0) # (N, 3, H, W)
+            captions = [d['caption'] for d in batch]
+            return {'image': images, 'caption': captions}
+        else:
+            images = [b['image'] for b in batch]
+            captions = [b['caption'] for b in batch]
+            images = torch.stack(images, dim=0)
+            return {'image': images, 'caption': captions}
+
+class AspectRatioBucketedDistributedSampler(torch.utils.data.distributed.DistributedSampler):
+    def __init__(self, dataset: Dataset, num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = False,
+                 aspect_ratios: List[float] = None, n_buckets: int = None, batch_size: Optional[int] = None) -> None:
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                "Invalid rank {}, rank should be in the interval"
+                " [0, {}]".format(rank, num_replicas - 1))
+        self.dataset = dataset
+        self.n_rank = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        # If the dataset length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and len(self.dataset) % self.n_rank != 0:  # type: ignore[arg-type]
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil(
+                (len(self.dataset) - self.n_rank) / self.n_rank  # type: ignore[arg-type]
+            )
+        else:
+            self.num_samples = math.ceil(len(self.dataset) / self.n_rank)  # type: ignore[arg-type]
+        self.total_size = self.num_samples * self.n_rank
+
+        if batch_size is None:
+            batch_size = getattr(dataset, 'batch_size', None)
+        if aspect_ratios is None:
+            aspect_ratios = getattr(dataset, 'aspect_ratios', None)
+        if n_buckets is None:
+            n_buckets = getattr(dataset, 'n_buckets', None)
+        assert batch_size    is not None, 'batch_size must be specified'
+        assert aspect_ratios is not None, 'aspect_ratios must be specified'
+        assert n_buckets     is not None, 'n_buckets must be specified'
+        assert batch_size > 0, 'batch_size must be greater than 0'
+        self.batch_size    = batch_size
+        self.aspect_ratios = aspect_ratios # dict of {path: aspect_ratio}
+        self.n_buckets     = n_buckets
+        self.buckets = self._get_buckets()
+        
+        self.do_shuffle = shuffle
+        self.seed = seed
+
+    def _get_buckets(self):
+        """
+        Returns a list of buckets, where each bucket is a list of indices of roughly the same aspect ratio.
+        """
+        # get aspect ratios
+        aspect_ratios = self.aspect_ratios
+        # match order to self.dataset.image_paths
+        aspect_ratios = [aspect_ratios[path] for path in self.dataset.image_paths]
+        # sort aspect ratios
+        sorted_idx = np.argsort(aspect_ratios)
+        # split sorted_idx into equal sized buckets
+        buckets = np.array_split(sorted_idx, self.n_buckets)
+        return buckets
+
+    def __iter__(self) -> Iterator:
+        if self.do_shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+        else:
+            indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
+        
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[:self.total_size]
+        assert len(indices) == self.total_size
+        
+        # subsample
+        indices = indices[self.rank:self.total_size:self.n_rank]
+        assert len(indices) == self.num_samples
+        
+        indices_buckets = []
+        for bucket in self.buckets:
+            indices_buckets.append([i for i in indices if i in bucket])
+        
+        # [[0, 2, 4, 6], [1, 3, 5, 7]] with batch size 2
+        # -> [[0, 2], [1, 3], [4, 6], [5, 7]]
+        # -> [0, 2, 1, 3, 4, 6, 5, 7]
+        indices = []
+        random_obj = random.Random(self.seed + self.epoch)
+        while any(len(bucket) > 0 for bucket in indices_buckets):
+            # add batch_size elements from random non-empty bucket
+            buckets = [b for b in indices_buckets if len(b) > 0]
+            bucket_idx = random_obj.choice(range(len(buckets)))
+            bucket_idx = (bucket_idx + self.rank) % len(buckets) # offset bucket by rank
+            bucket = buckets[bucket_idx]
+            indices.extend(bucket[:self.batch_size])
+            del bucket[:self.batch_size]
+        assert len(indices) == self.num_samples
+        
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+
 
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
                  wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
-                 shuffle_val_dataloader=False):
+                 shuffle_val_dataloader=False, double_dataloaders=False, bucket_sampler=False, rank=0, n_rank=0):
         super().__init__()
         self.batch_size = batch_size
         self.dataset_configs = dict()
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         self.use_worker_init_fn = use_worker_init_fn
+        self.double_dataloaders = double_dataloaders # use two dataloaders for evaluations
+        self.bucket_sampler = bucket_sampler
+        self.rank = rank
+        self.n_rank = n_rank
         if train is not None:
             self.dataset_configs["train"] = train
             self.train_dataloader = self._train_dataloader
@@ -193,40 +424,96 @@ class DataModuleFromConfig(pl.LightningDataModule):
         if self.wrap:
             for k in self.datasets:
                 self.datasets[k] = WrappedDataset(self.datasets[k])
-
+        self.collate_fns = {
+            k: AspectRatioBucketedCollateFunc(
+                self.datasets[k].size,
+                self.datasets[k].allow_rectangle_batches,
+                self.datasets[k].variable_image_size,
+            ) for k in self.datasets}
+    
     def _train_dataloader(self):
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
             init_fn = None
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn)
+        
+        shuffle = False if is_iterable_dataset else True
+        
+        if self.bucket_sampler:
+            sampler = AspectRatioBucketedDistributedSampler(
+                self.datasets['train'],
+                num_replicas=self.n_rank,
+                rank=self.rank,
+                seed=0,
+                batch_size=self.batch_size,
+                shuffle=shuffle,
+            )
+            shuffle = None
+        
+        return DataLoader(self.datasets["train"],
+                          batch_size=self.batch_size,
+                          num_workers=self.num_workers,
+                          shuffle=shuffle,
+                          sampler=sampler,
+                          worker_init_fn=init_fn,
+                          collate_fn=self.collate_fns["train"])
 
     def _val_dataloader(self, shuffle=False):
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
             init_fn = None
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers,
-                          worker_init_fn=init_fn,
-                          shuffle=shuffle)
-
+        
+        if self.bucket_sampler:
+            sampler = AspectRatioBucketedDistributedSampler(
+                self.datasets['validation'],
+                num_replicas=self.n_rank,
+                rank=self.rank,
+                seed=0,
+                batch_size=self.batch_size,
+                shuffle=shuffle,
+            )
+            shuffle = None
+        
+        dataloader = DataLoader(self.datasets["validation"],
+                   batch_size=self.batch_size,
+                   num_workers=self.num_workers,
+                   shuffle=shuffle,
+                   sampler=sampler,
+                   worker_init_fn=init_fn,
+                   collate_fn=self.collate_fns["validation"])
+        if self.double_dataloaders:
+            return [dataloader, dataloader]
+        return dataloader
+    
     def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
+        is_iterable_dataset = isinstance(self.datasets['test'], Txt2ImgIterableBaseDataset)
         if is_iterable_dataset or self.use_worker_init_fn:
             init_fn = worker_init_fn
         else:
             init_fn = None
-
+        
         # do not shuffle dataloader for iterable dataset
         shuffle = shuffle and (not is_iterable_dataset)
+        
+        if self.bucket_sampler:
+            sampler = AspectRatioBucketedDistributedSampler(
+                self.datasets['test'],
+                num_replicas=self.n_rank,
+                rank=self.rank,
+                seed=0,
+                batch_size=self.batch_size,
+                shuffle=shuffle,
+            )
+            shuffle = None
 
-        return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle)
+        dataloader = DataLoader(self.datasets["test"], batch_size=self.batch_size,
+                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle,
+                          sampler=sampler, collate_fn=self.collate_fns["test"])
+        if self.double_dataloaders:
+            return [dataloader, dataloader]
+        return dataloader
 
     def _predict_dataloader(self, shuffle=False):
         if isinstance(self.datasets['predict'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -234,7 +521,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
         else:
             init_fn = None
         return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn)
+                          num_workers=self.num_workers, worker_init_fn=init_fn,
+                          collate_fn=self.collate_fns["predict"])
 
 
 class SetupCallback(Callback):
@@ -249,6 +537,7 @@ class SetupCallback(Callback):
         self.lightning_config = lightning_config
 
     def on_keyboard_interrupt(self, trainer, pl_module):
+        raise KeyboardInterrupt
         if trainer.global_rank == 0:
             print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
@@ -274,7 +563,7 @@ class SetupCallback(Callback):
             OmegaConf.save(OmegaConf.create({"lightning": self.lightning_config}),
                            os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)))
 
-        else:
+        elif 0:
             # ModelCheckpoint callback created log directory --- remove it
             if not self.resume and os.path.exists(self.logdir):
                 dst, name = os.path.split(self.logdir)
@@ -297,7 +586,8 @@ class ImageLogger(Callback):
         self.logger_log_images = {
             pl.loggers.TestTubeLogger: self._testtube,
         }
-        self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
+        min_batch_freq = 256
+        self.log_steps = [2 ** n for n in range(int(np.log2(min_batch_freq)), int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
         self.clamp = clamp
@@ -328,11 +618,7 @@ class ImageLogger(Callback):
             grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
             grid = grid.numpy()
             grid = (grid * 255).astype(np.uint8)
-            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
-                k,
-                global_step,
-                current_epoch,
-                batch_idx)
+            filename = f"{global_step:06}it_{batch_idx:06}_{k}.png"
             path = os.path.join(root, filename)
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             Image.fromarray(grid).save(path)
@@ -400,7 +686,7 @@ class CUDACallback(Callback):
         torch.cuda.synchronize(trainer.root_gpu)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
+    def on_train_epoch_end(self, trainer, pl_module):
         torch.cuda.synchronize(trainer.root_gpu)
         max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
         epoch_time = time.time() - self.start_time
@@ -474,6 +760,9 @@ if __name__ == "__main__":
             "If you want to resume training in a new log folder, "
             "use -n/--name in combination with --resume_from_checkpoint"
         )
+    
+    weight_path = None
+    checkpoint_iteration_from_name = None
     if opt.resume:
         if not os.path.exists(opt.resume):
             raise ValueError("Cannot find {}".format(opt.resume))
@@ -492,60 +781,120 @@ if __name__ == "__main__":
         base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
         opt.base = base_configs + opt.base
         _tmp = logdir.split("/")
-        nowname = _tmp[-1]
+        logname = _tmp[-1]
     else:
         if opt.name:
-            name = "_" + opt.name
+            name = opt.name
         elif opt.base:
             cfg_fname = os.path.split(opt.base[0])[-1]
             cfg_name = os.path.splitext(cfg_fname)[0]
-            name = "_" + cfg_name
+            name = cfg_name
         else:
             name = ""
-        nowname = now + name + opt.postfix
-        logdir = os.path.join(opt.logdir, nowname)
-
+        logname = name + opt.postfix
+        if opt.dated_logdir:
+            logname = f'{now}_{logname}'
+        logdir = os.path.join(opt.logdir, logname)
+        
+        if opt.resume_from_checkpoint is not None:
+            # using regex extract int from "/weights_{int}.pt"
+            match = re.search(r'weights_(\d+).pt', opt.resume_from_checkpoint)
+            if match:
+                checkpoint_iteration_from_name = int(match.group(1))
+            
+            # load weight path manually instead of using trainer.load_checkpoint (hacky workaround)
+            weight_path = opt.resume_from_checkpoint # load weights only
+            opt.resume_from_checkpoint = None        # load weights only
+    
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed)
+    
+    # init and save configs
+    configs = [OmegaConf.load(cfg) for cfg in opt.base]
+    cli = OmegaConf.from_dotlist(unknown)
+    config = OmegaConf.merge(*configs, cli)
+    lightning_config = config.pop("lightning", OmegaConf.create())
+    # merge trainer cli with config
+    trainer_config = lightning_config.get("trainer", OmegaConf.create())
+    use_deepspeed = trainer_config.pop("use_deepspeed", False)
+    # default to ddp
+    #trainer_config["accelerator"] = "deepspeed_stage_2_offload"
+    for k in nondefault_trainer_args(opt):
+        trainer_config[k] = getattr(opt, k)
+    #if not "gpus" in trainer_config:
+    #    del trainer_config["accelerator"]
+    #    cpu = True
+    #else:
+    #    gpuinfo = trainer_config["gpus"]
+    #    print(f"Running on GPUs {gpuinfo}")
+    cpu = False
+    trainer_opt = argparse.Namespace(**trainer_config)
+    lightning_config.trainer = trainer_config
 
-    try:
-        # init and save configs
-        configs = [OmegaConf.load(cfg) for cfg in opt.base]
-        cli = OmegaConf.from_dotlist(unknown)
-        config = OmegaConf.merge(*configs, cli)
-        lightning_config = config.pop("lightning", OmegaConf.create())
-        # merge trainer cli with config
-        trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        trainer_config["accelerator"] = "ddp"
-        for k in nondefault_trainer_args(opt):
-            trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
-            cpu = True
-        else:
-            gpuinfo = trainer_config["gpus"]
-            print(f"Running on GPUs {gpuinfo}")
-            cpu = False
-        trainer_opt = argparse.Namespace(**trainer_config)
-        lightning_config.trainer = trainer_config
+    # init model
+    model = instantiate_from_config(config.model)
+    
+    # load checkpoint(s) before Lightning/DeepSpeed init
+    # since these checkpoints are loaded earlier, they don't have to follow the Deepspeed format.
+    missing_keys = []
+    if weight_path:
+        # weight_path can be comma separated list of weight_paths
+        # merge them into one sd dict
+        sd = {}
+        for w_path in weight_path.split(","):
+            pl_sd = torch.load(w_path, map_location="cpu")
+            if "global_step" in pl_sd:
+                print(f"Global Step: {pl_sd['global_step']}")
+            if len(pl_sd) < 64 and "state_dict" in pl_sd:
+                pl_sd = pl_sd["state_dict"]
+            if len(pl_sd) < 64 and "module" in pl_sd:
+                module = pl_sd["module"]
+                del pl_sd["module"]
+                pl_sd = {**module, **pl_sd}
+            
+            pl_sd = {k.split('module.')[-1]: v for k, v in pl_sd.items()}
+            
+            # if state_dict doesn't have "first_stage_model" or "cond_stage_model"
+            # assume it is a VAE state_dict and load it into "first_stage_model"
+            is_vae = not any("first_stage_model" in k or "cond_stage_model" in k for k in pl_sd.keys())
+            if is_vae:
+                pl_sd = {f'first_stage_model.{k}': v for k, v in pl_sd.items()}
+            sd.update(pl_sd)
+        missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
+        del pl_sd, sd
+        print('')
+        print(f'Loaded checkpoint {weight_path}')
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")
+        print(f"Missing {len(missing_keys)} keys and {len(unexpected_keys)} unexpected keys")
+        print('')
+    
+    print(sorted(set(".".join(k.split(".")[:2]) for k in model.state_dict().keys())))
+    
+    if opt.use_ema_weights:
+        print('\n\nUsing EMA weights!')
+        time.sleep(2)
+        if not any(k.startswith('model_ema.') for k in missing_keys):
+            # if model_ema is not missing, load it
+            model.model_ema.copy_to(model.model)
+        if not any(k.startswith('cond_stage_model_ema.') for k in missing_keys) and hasattr(model, 'cond_stage_model_ema'):
+            # if cond_stage_model_ema is not missing, load it
+            model.cond_stage_model_ema.copy_to(model.cond_stage_model)
+    
+    # trainer and callbacks
+    trainer_kwargs = dict()
 
-        # model
-        model = instantiate_from_config(config.model)
-
-        # trainer and callbacks
-        trainer_kwargs = dict()
-
-        # default logger configs
+    # default logger configs
+    if 1:
         default_logger_cfgs = {
             "wandb": {
                 "target": "pytorch_lightning.loggers.WandbLogger",
                 "params": {
-                    "name": nowname,
+                    "name": logname,
                     "save_dir": logdir,
                     "offline": opt.debug,
-                    "id": nowname,
+                    "id": logname,
                 }
             },
             "testtube": {
@@ -563,23 +912,20 @@ if __name__ == "__main__":
             logger_cfg = OmegaConf.create()
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
         trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
-
-        # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
-        # specify which metric is used to determine best models
-        default_modelckpt_cfg = {
-            "target": "pytorch_lightning.callbacks.ModelCheckpoint",
-            "params": {
-                "dirpath": ckptdir,
-                "filename": "{epoch:06}",
-                "verbose": True,
-                "save_last": True,
-            }
-        }
+    
+    # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
+    # specify which metric is used to determine best models
+    if 1:
+        default_modelckpt_cfg = {"target": "pytorch_lightning.callbacks.ModelCheckpoint", "params": {}}
+        default_modelckpt_cfg["params"]['dirpath'  ] = ckptdir
+        default_modelckpt_cfg["params"]['filename' ] = "{step}"
+        default_modelckpt_cfg["params"]['verbose'  ] = True
+        default_modelckpt_cfg["params"]['save_last'] = True
         if hasattr(model, "monitor"):
             print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["save_top_k"] = 3
-
+            default_modelckpt_cfg["params"]["save_top_k"] = 1
+        
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
         else:
@@ -589,7 +935,8 @@ if __name__ == "__main__":
         if version.parse(pl.__version__) < version.parse('1.4.0'):
             trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
 
-        # add callback which sets up log directory
+    # add callback which sets up log directory
+    if 1:
         default_callbacks_cfg = {
             "setup_callback": {
                 "target": "main.SetupCallback",
@@ -606,7 +953,7 @@ if __name__ == "__main__":
             "image_logger": {
                 "target": "main.ImageLogger",
                 "params": {
-                    "batch_frequency": 750,
+                    "batch_frequency": 2**20, # 1_048_576
                     "max_images": 4,
                     "clamp": True
                 }
@@ -622,9 +969,7 @@ if __name__ == "__main__":
                 "target": "main.CUDACallback"
             },
         }
-        if version.parse(pl.__version__) >= version.parse('1.4.0'):
-            default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg})
-
+        
         if "callbacks" in lightning_config:
             callbacks_cfg = lightning_config.callbacks
         else:
@@ -634,108 +979,109 @@ if __name__ == "__main__":
             print(
                 'Caution: Saving checkpoints every n train steps without deleting. This might require some free space.')
             default_metrics_over_trainsteps_ckpt_dict = {
-                'metrics_over_trainsteps_checkpoint':
-                    {"target": 'pytorch_lightning.callbacks.ModelCheckpoint',
-                     'params': {
-                         "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
-                         "filename": "{epoch:06}-{step:09}",
-                         "verbose": True,
-                         'save_top_k': -1,
-                         'every_n_train_steps': 10000,
-                         'save_weights_only': True
-                     }
-                     }
+                'metrics_over_trainsteps_checkpoint': {
+                    'target': 'pytorch_lightning.callbacks.ModelCheckpoint',
+                    'params': {
+                        "dirpath": os.path.join(ckptdir, 'trainstep_checkpoints'),
+                        "filename": "{epoch:06}-{step:09}",
+                        "verbose": True,
+                        'save_top_k': -1,
+                        'every_n_train_steps': 500,
+                        'save_weights_only': True,
+                    }
+                }
             }
             default_callbacks_cfg.update(default_metrics_over_trainsteps_ckpt_dict)
-
+        
+        if version.parse(pl.__version__) >= version.parse('1.4.0'):
+            default_callbacks_cfg.update({'checkpoint_callback': modelckpt_cfg}) # add modelcheckpoint to end of callbacks
+            if getattr(config.model.params, 'use_ema'):
+                ema_modelckpt_cfg = deepcopy(modelckpt_cfg)
+                ema_modelckpt_cfg["params"]["monitor"] = f'{model.monitor}_ema'
+                ema_modelckpt_cfg["params"]['save_last'] = False
+                default_callbacks_cfg.update({'ema_checkpoint_callback': ema_modelckpt_cfg}) # add ema modelcheckpoint to end of callbacks
+        
         callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
-        if 'ignore_keys_callback' in callbacks_cfg and hasattr(trainer_opt, 'resume_from_checkpoint'):
-            callbacks_cfg.ignore_keys_callback.params['ckpt_path'] = trainer_opt.resume_from_checkpoint
-        elif 'ignore_keys_callback' in callbacks_cfg:
-            del callbacks_cfg['ignore_keys_callback']
+    
+    if 'ignore_keys_callback' in callbacks_cfg and hasattr(trainer_opt, 'resume_from_checkpoint'):
+        callbacks_cfg.ignore_keys_callback.params['ckpt_path'] = trainer_opt.resume_from_checkpoint
+    elif 'ignore_keys_callback' in callbacks_cfg:
+        del callbacks_cfg['ignore_keys_callback']
+    
+    trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
-        trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
-
-        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
-        trainer.logdir = logdir  ###
-
-        # data
-        data = instantiate_from_config(config.data)
-        # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
-        # calling these ourselves should not be necessary but it is.
-        # lightning still takes care of proper multiprocessing though
-        data.prepare_data()
-        data.setup()
-        print("#### Data #####")
-        for k in data.datasets:
-            print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
-
-        # configure learning rate
-        bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
-        if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
-        else:
-            ngpu = 1
-        if 'accumulate_grad_batches' in lightning_config.trainer:
-            accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches
-        else:
-            accumulate_grad_batches = 1
-        print(f"accumulate_grad_batches = {accumulate_grad_batches}")
-        lightning_config.trainer.accumulate_grad_batches = accumulate_grad_batches
-        if opt.scale_lr:
-            model.learning_rate = accumulate_grad_batches * ngpu * bs * base_lr
-            print(
-                "Setting learning rate to {:.2e} = {} (accumulate_grad_batches) * {} (num_gpus) * {} (batchsize) * {:.2e} (base_lr)".format(
-                    model.learning_rate, accumulate_grad_batches, ngpu, bs, base_lr))
-        else:
-            model.learning_rate = base_lr
-            print("++++ NOT USING LR SCALING ++++")
-            print(f"Setting learning rate to {model.learning_rate:.2e}")
-
-
-        # allow checkpointing via USR1
-        def melk(*args, **kwargs):
-            # run all checkpoint hooks
-            if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
-                ckpt_path = os.path.join(ckptdir, "last.ckpt")
-                trainer.save_checkpoint(ckpt_path)
-
-
-        def divein(*args, **kwargs):
-            if trainer.global_rank == 0:
-                import pudb;
-                pudb.set_trace()
-
-
-        import signal
-
-        signal.signal(signal.SIGUSR1, melk)
-        signal.signal(signal.SIGUSR2, divein)
-
-        # run
-        if opt.train:
-            try:
-                trainer.fit(model, data)
-            except Exception:
-                melk()
-                raise
-        if not opt.no_test and not trainer.interrupted:
-            trainer.test(model, data)
-    except Exception:
-        if opt.debug and trainer.global_rank == 0:
-            try:
-                import pudb as debugger
-            except ImportError:
-                import pdb as debugger
-            debugger.post_mortem()
-        raise
-    finally:
-        # move newly created debug project to debug_runs
-        if opt.debug and not opt.resume and trainer.global_rank == 0:
-            dst, name = os.path.split(logdir)
-            dst = os.path.join(dst, "debug_runs", name)
-            os.makedirs(os.path.split(dst)[0], exist_ok=True)
-            os.rename(logdir, dst)
-        if trainer.global_rank == 0:
-            print(trainer.profiler.summary())
+    from pytorch_lightning.strategies import DeepSpeedStrategy
+    trainer = Trainer.from_argparse_args(
+        trainer_opt,
+        **trainer_kwargs,
+        strategy = DeepSpeedStrategy(
+            stage=2,
+            offload_optimizer =True,
+            offload_parameters=False, # needs stage=3 to work
+            allgather_bucket_size=100_000_000,
+            reduce_bucket_size   =100_000_000,
+            logging_batch_size_per_gpu=config.data.params.batch_size,
+        ) if use_deepspeed else DDPPlugin(find_unused_parameters=False),
+    )
+    trainer.logdir = logdir
+    
+    # data
+    if hasattr(config.model.params, 'use_ema'):
+        config.data.params.double_dataloaders = config.model.params.use_ema
+    else:
+        print('No use_ema in config.model.params. Assuming False.')
+        config.data.params.double_dataloaders = False
+    config.data.params.rank = trainer.global_rank
+    config.data.params.n_rank = trainer.world_size
+    data = instantiate_from_config(config.data)
+    # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
+    # calling these ourselves should not be necessary but it is.
+    # lightning still takes care of proper multiprocessing though
+    data.prepare_data()
+    data.setup()
+    print("#### Data #####")
+    for k in data.datasets:
+        print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
+    
+    # get num_gpus
+    if not cpu:
+        ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+    else:
+        ngpu = 1
+    
+    # configure learning rate
+    bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
+    if 'accumulate_grad_batches' in lightning_config.trainer:
+        accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches
+    else:
+        accumulate_grad_batches = 1
+    print(f"accumulate_grad_batches = {accumulate_grad_batches}")
+    lightning_config.trainer.accumulate_grad_batches = accumulate_grad_batches
+    if opt.scale_lr:
+        model.learning_rate = (accumulate_grad_batches * ngpu * bs)**0.5 * base_lr
+        print(
+            "Setting learning rate to {:.2e} = {} (accumulate_grad_batches) * {} (num_gpus) * {} (batchsize) * {:.2e} (base_lr)".format(
+                model.learning_rate, accumulate_grad_batches, ngpu, bs, base_lr))
+    else:
+        model.learning_rate = base_lr
+        print("++++ NOT USING LR SCALING ++++")
+        print(f"Setting learning rate to {model.learning_rate:.2e}")
+    
+    # run
+    if opt.train:
+        try:
+            trainer.fit(model, data)
+            print("Training finished")
+        except Exception:
+            raise
+    
+    # perform final evaluation and save results
+    trainer.validate(model, data)
+    
+    ckpt_path = os.path.join(ckptdir, "last.ckpt")
+    trainer.save_checkpoint(ckpt_path)
+    
+    if trainer.global_rank == 0:
+        os.system(f'cd {ckpt_path}; python zero_to_fp32.py . ./weights.pt')
+        sd = torch.load(f'{ckpt_path}/final_weights.pt')
+        sd = {k.replace('module.', ''): v for k, v in sd.items()}

@@ -1,7 +1,14 @@
+import gc
+
 import torch
 import pytorch_lightning as pl
 import torch.nn.functional as F
 from contextlib import contextmanager
+
+from fairscale.nn import auto_wrap
+from pytorch_lightning.utilities.seed import isolate_rng, seed_everything
+
+from ldm.modules.ema import LitEma
 
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
@@ -292,6 +299,8 @@ class AutoencoderKL(pl.LightningModule):
                  image_key="image",
                  colorize_nlabels=None,
                  monitor=None,
+                 use_ema=False,
+                 use_disc=False,
                  ):
         super().__init__()
         self.image_key = image_key
@@ -301,6 +310,24 @@ class AutoencoderKL(pl.LightningModule):
         assert ddconfig["double_z"]
         self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+
+        self.use_disc = use_disc
+
+        self.use_ema = use_ema
+        if self.use_ema:
+            self.ema_attrs = ['encoder', 'decoder', 'quant_conv', 'post_quant_conv']
+            def track_ema(name):
+                ema = LitEma(
+                    getattr(self, name),
+                    rank=self.global_rank,
+                    half_life=4000//4,  # 4k steps with gradient accumulation of 4
+                    device='cpu',
+                    force_dtype=None,
+                )
+                setattr(self, f"{name}_ema", ema)
+            for name in self.ema_attrs:
+                track_ema(name)
+        
         self.embed_dim = embed_dim
         if colorize_nlabels is not None:
             assert type(colorize_nlabels)==int
@@ -310,6 +337,12 @@ class AutoencoderKL(pl.LightningModule):
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
+    def configure_sharded_model(self) -> None:
+        self.encoder = auto_wrap(self.encoder)
+        self.decoder = auto_wrap(self.decoder)
+        self.quant_conv = auto_wrap(self.quant_conv)
+        self.post_quant_conv = auto_wrap(self.post_quant_conv)
+    
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
@@ -341,48 +374,50 @@ class AutoencoderKL(pl.LightningModule):
         dec = self.decode(z)
         return dec, posterior
 
-    def get_input(self, batch, k):
+    def get_input(self, batch, k='image'):
         x = batch[k]
         if len(x.shape) == 3:
             x = x[..., None]
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
         return x
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
+    def training_step(self, batch, batch_idx, optimizer_idx=0):
         inputs = self.get_input(batch, self.image_key)
         reconstructions, posterior = self(inputs)
-
+        
         if optimizer_idx == 0:
             # train encoder+decoder+logvar
             aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
-            self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            self.log("aeloss", aeloss, prog_bar=True , logger=True, on_step=True, on_epoch=True )
             self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
             return aeloss
-
-        if optimizer_idx == 1:
+        
+        elif optimizer_idx == 1:
             # train the discriminator
             discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
                                                 last_layer=self.get_last_layer(), split="train")
-
-            self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            
+            self.log("discloss", discloss, prog_bar=True , logger=True, on_step=True, on_epoch=True )
+            self.log_dict(log_dict_disc  , prog_bar=False, logger=True, on_step=True, on_epoch=False)
             return discloss
 
     def validation_step(self, batch, batch_idx):
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
-        aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="val")
-
-        discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
+        with isolate_rng(): # isolate rng for each validation step
+            seed_everything(batch_idx) # for reproducibility of validation
+            inputs = self.get_input(batch, self.image_key)
+            reconstructions, posterior = self(inputs)
+            aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
                                             last_layer=self.get_last_layer(), split="val")
-
+            
+            discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
+                                                last_layer=self.get_last_layer(), split="val")
+        
         self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
         self.log_dict(log_dict_ae)
         self.log_dict(log_dict_disc)
         return self.log_dict
-
+    
     def configure_optimizers(self):
         lr = self.learning_rate
         opt_ae = torch.optim.Adam(list(self.encoder.parameters())+
@@ -390,10 +425,42 @@ class AutoencoderKL(pl.LightningModule):
                                   list(self.quant_conv.parameters())+
                                   list(self.post_quant_conv.parameters()),
                                   lr=lr, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-                                    lr=lr, betas=(0.5, 0.9))
-        return [opt_ae, opt_disc], []
+        if self.loss.use_discriminator:
+            opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+                                        lr=lr, betas=(0.5, 0.9))
+            print("Using discriminator")
+            return [opt_ae, opt_disc], []
+        else:
+            print("Not using discriminator")
+            return opt_ae
+    
+    def optimizer_step(self, *args, **kwargs):
+        _ = super().optimizer_step(*args, **kwargs)
+        if self.use_ema:
+            for name in self.ema_attrs:
+                getattr(self, f'{name}_ema').rank = self.global_rank
+                getattr(self, f'{name}_ema')(getattr(self, name))
+        return _
 
+    def load_ema(self):
+        for name in self.ema_attrs:
+            getattr(self, f'{name}_ema').swap_state(getattr(self, name))  # swap weights and shadow weights
+
+    def unload_ema(self):
+        for name in self.ema_attrs:
+            getattr(self, f'{name}_ema').swap_state(getattr(self, name))  # swap weights and shadow weights
+        # garbage collection since RAM is limited
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def on_validation_epoch_start(self, *args, **kwargs):
+        if self.use_ema:
+            self.load_ema()
+
+    def on_validation_epoch_end(self, *args, **kwargs):
+        if self.use_ema:
+            self.unload_ema()
+    
     def get_last_layer(self):
         return self.decoder.conv_out.weight
 

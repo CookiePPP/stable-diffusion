@@ -150,6 +150,8 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
+    use_flash_attention: bool = True
+    
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
         super().__init__()
         inner_dim = dim_head * heads
@@ -157,8 +159,9 @@ class CrossAttention(nn.Module):
 
         self.scale = dim_head ** -0.5
         self.heads = heads
-
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.dim_head = dim_head
+        
+        self.to_q = nn.Linear(  query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
@@ -166,31 +169,101 @@ class CrossAttention(nn.Module):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
+        
+        # Setup [flash attention](https://github.com/HazyResearch/flash-attention).
+        # Flash attention is only used if it's installed
+        # and `CrossAttention.use_flash_attention` is set to `True`.
+        try:
+            # You can install flash attention by cloning their Github repo,
+            # [https://github.com/HazyResearch/flash-attention](https://github.com/HazyResearch/flash-attention)
+            # and then running `python setup.py install`
+            from flash_attn.flash_attention import FlashAttention
+            self.flash = FlashAttention()
+            # Set the scale for scaled dot-product attention.
+            self.flash.softmax_scale = self.scale
+        # Set to `None` if it's not installed
+        except ImportError:
+            self.flash = None
 
     def forward(self, x, context=None, mask=None):
-        h = self.heads
-
-        q = self.to_q(x)
+        has_cond = context is not None
         context = default(context, x)
+        h = self.heads
+        
+        q = self.to_q(x)
         k = self.to_k(context)
         v = self.to_v(context)
 
+        # Use flash attention if it's available and the head size is less than or equal to `128`
+        if CrossAttention.use_flash_attention \
+                and (self.flash is not None) \
+                and (not has_cond) \
+                and (self.dim_head <= 64): # RTX 30 series required for 128
+            out = self.flash_attention(q, k, v)
+            #print("Using flash attention")
+        else:
+            out = self.normal_attention(h, k, mask, q, v)
+            #print("Using normal attention")
+        return out
+    
+    def flash_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        """
+        #### Flash Attention
+        :param q: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        :param k: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        :param v: are the query vectors before splitting heads, of shape `[batch_size, seq, d_attn]`
+        """
+
+        # Get batch size and number of elements along sequence axis (`width * height`)
+        batch_size, seq_len, _ = q.shape
+
+        # Stack `q`, `k`, `v` vectors for flash attention, to get a single tensor of
+        # shape `[batch_size, seq_len, 3, heads * dim_head]`
+        qkv = torch.stack((q, k, v), dim=2)
+        # Split the heads
+        qkv = qkv.view(batch_size, seq_len, 3, self.heads, self.dim_head)
+
+        # Flash attention works for head sizes `32`, `64` and `128`, so we have to pad the heads to
+        # fit this size.
+        if self.dim_head <= 32:
+            pad = 32 - self.dim_head
+        elif self.dim_head <= 64:
+            pad = 64 - self.dim_head
+        elif self.dim_head <= 128:
+            pad = 128 - self.dim_head
+        else:
+            raise ValueError(f'Head size ${self.dim_head} too large for Flash Attention')
+
+        # Pad the heads
+        if pad:
+            qkv = torch.cat((qkv, qkv.new_zeros(batch_size, seq_len, 3, self.heads, pad)), dim=-1)
+
+        # Compute attention
+        # $$\underset{seq}{softmax}\Bigg(\frac{Q K^\top}{\sqrt{d_{key}}}\Bigg)V$$
+        # This gives a tensor of shape `[batch_size, seq_len, heads, d_padded]`
+        out = self.flash(qkv.half())[0].to(q.dtype)
+        # Truncate the extra head size
+        out = out[:, :, :, :self.dim_head]
+        # Reshape to `[batch_size, seq_len, heads * dim_head]`
+        out = out.reshape(batch_size, seq_len, self.heads * self.dim_head)
+
+        # Map to `[batch_size, height * width, d_model]` with a linear layer
+        return self.to_out(out)
+    
+    def normal_attention(self, h, k, mask, q, v):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
             max_neg_value = -torch.finfo(sim.dtype).max
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
-
         # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
-
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+        out = self.to_out(out)
+        return out
 
 
 class BasicTransformerBlock(nn.Module):

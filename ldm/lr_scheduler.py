@@ -96,3 +96,86 @@ class LambdaLinearScheduler(LambdaWarmUpCosineScheduler2):
             self.last_f = f
             return f
 
+class LambdaExponentialScheduler:
+    """
+    note: use with a base_lr of 1.0
+    """
+    def __init__(self, warm_up_steps, lr_min, lr_max, lr_start, normal_steps, decay_steps, cycle = False, verbosity_interval=0):
+        self.n_warm_up_steps = warm_up_steps # number of steps to warm up
+        self.lr_start = lr_start
+        self.lr_min = lr_min
+        self.lr_max = lr_max
+        self.n_max_steps = normal_steps
+        self.n_decay_steps = decay_steps # number of steps to perform decay for
+        self.last_lr = 0.
+        self.cycle = cycle
+        self.verbosity_interval = verbosity_interval
+
+    def schedule(self, n, **kwargs):
+        if self.verbosity_interval > 0:
+            if n % self.verbosity_interval == 0: print(f"current step: {n}, recent lr-multiplier: {self.last_lr}")
+        if self.cycle and n > self.n_warm_up_steps + self.n_decay_steps:
+            n = n % (self.n_warm_up_steps + self.n_max_steps + self.n_decay_steps)
+        if n < self.n_warm_up_steps:
+            # exponential warmup
+            lr = self.lr_start * (self.lr_max / self.lr_start) ** (n / self.n_warm_up_steps)
+            self.last_lr = lr
+            return lr
+        elif n < self.n_warm_up_steps+self.n_max_steps:
+            # constant
+            lr = self.lr_max
+            self.last_lr = lr
+            return lr
+        else:
+            # cosine decay
+            decay_steps_elapsed = n - (self.n_warm_up_steps+self.n_max_steps)
+            t = decay_steps_elapsed / self.n_decay_steps # get the fraction of decay steps elapsed
+            t = min(t, 1.0) # clamp to 1.0
+            lr = self.lr_min + 0.5 * (self.lr_max - self.lr_min) * (1 + np.cos(t * np.pi))
+            self.last_lr = lr
+            return lr
+
+    def __call__(self, n, **kwargs):
+        return self.schedule(n, **kwargs)
+
+class LambdaCosineScheduler:
+    """
+    note: use with a base_lr of 1.0
+    """
+    def __init__(self, warm_up_steps, lr_min, lr_max, lr_start, normal_steps, decay_steps, cycle = False, verbosity_interval=0):
+        self.n_warm_up_steps = warm_up_steps # number of steps to warm up
+        self.lr_start = lr_start
+        self.lr_min = lr_min
+        self.lr_max = lr_max
+        self.n_max_steps = normal_steps
+        self.n_decay_steps = decay_steps # number of steps to perform decay for
+        self.last_lr = 0.
+        self.cycle = cycle
+        self.verbosity_interval = verbosity_interval
+
+    def schedule(self, n, **kwargs):
+        if self.verbosity_interval > 0:
+            if n % self.verbosity_interval == 0: print(f"current step: {n}, recent lr-multiplier: {self.last_lr}")
+        if self.cycle and n > self.n_warm_up_steps + self.n_decay_steps:
+            n = n % (self.n_warm_up_steps + self.n_max_steps + self.n_decay_steps)
+        if n < self.n_warm_up_steps:
+            # cosine warmup
+            lr = self.lr_start + 0.5 * (self.lr_max - self.lr_start) * (1 + np.cos((self.n_warm_up_steps-n) / self.n_warm_up_steps * np.pi))
+            self.last_lr = lr
+            return lr
+        elif n < self.n_warm_up_steps+self.n_max_steps:
+            # constant
+            lr = self.lr_max
+            self.last_lr = lr
+            return lr
+        else:
+            # cosine decay
+            decay_steps_elapsed = n - (self.n_warm_up_steps+self.n_max_steps)
+            t = decay_steps_elapsed / self.n_decay_steps # get the fraction of decay steps elapsed
+            t = min(t, 1.0) # clamp to 1.0
+            lr = self.lr_min + 0.5 * (self.lr_max - self.lr_min) * (1 + np.cos(t * np.pi))
+            self.last_lr = lr
+            return lr
+
+    def __call__(self, n, **kwargs):
+        return self.schedule(n, **kwargs)

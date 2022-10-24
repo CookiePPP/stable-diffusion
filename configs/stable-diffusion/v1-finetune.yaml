@@ -1,0 +1,153 @@
+lightning:
+  trainer:
+    log_every_n_steps: 1
+    max_steps: 1000000
+    fast_dev_run: False
+
+    use_deepspeed: True # shard optimizer and offload to system memory
+    val_check_interval: 1000 # validate every checkpoint before saving
+    accumulate_grad_batches: 8 # accumulate gradients over 4 batches
+    benchmark: False # use cudnn benchmarking to find the fastest convolution algorithms. Should only be used for exactly reproducible experiments, because it can slow down the first epoch.
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        disabled: True
+model:
+  # The original stable-diffusion was trained with constant 2.21e-6 base learning rate
+  # base learning rate suggested for fune-tuning Dreambooth is 0.71e-6
+  # I found 5e-6 to train faster and reduce overfitting on 30k images
+  # On larger datasets, I would recommend starting with 5e-6 then reducing to 2.21e-6
+  base_learning_rate: 5.0e-6
+
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    scheduler_config:
+      target: ldm.lr_scheduler.LambdaCosineScheduler
+      params:
+        lr_start: 0.1
+        lr_max: 1.0
+        lr_min: 0.1
+
+        warm_up_steps: 200    # 0.04 days
+        normal_steps : 200000 # 46.3 days
+        decay_steps  : 1000   # 0.22 days
+
+        cycle: True
+
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "image"
+    cond_stage_key: "caption"
+    image_size: 64
+    channels: 4
+    first_stage_trainable: False
+    cond_stage_trainable : True   # Note: different from the one we trained before
+    unet_trainable: True # Should be True Always
+    conditioning_key: crossattn
+    monitor: "val/loss_simple"
+    scale_factor: 0.18215
+    use_ema: True
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult:
+          - 1 #  320dim @ 32x32 (VAE resolution)
+          - 2 #  640dim @ 16x16
+          - 4 # 1280dim @  8x8
+          - 4 # 1280dim @  4x4
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 768
+        use_checkpoint: True
+        legacy: False
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: "val/rec_loss"
+        ddconfig:
+          in_channels: 3 # RGB
+          out_ch: 3 # RGB
+          double_z: true
+          z_channels: 4 # latent dimension
+          resolution: 256 # this parameter doesn't really do anything
+          ch: 128
+          ch_mult:
+            - 1 # 128dim @ 256x256 (native resolution)
+            - 2 # 256dim @ 128x128
+            - 4 # 512dim @  64x64
+            - 4 # 512dim @  32x32
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size : 5
+    num_workers: 1
+    wrap: false
+    bucket_sampler: true # put similar aspect ratio images in the same batch
+    train:
+      target: ldm.data.personalized.PersonalizedBase
+      params:
+        set: train
+        data_root     : "/media/cookie/WD6TB/Derpi/dataset_v5/train"
+        tagdata_path  : "/media/cookie/WD6TB/Derpi/Derpi/metadata/tagsdata.p"
+        scoreperc_path: "/media/cookie/SN850/derpy-score-predictor/data/scores_v3.json"
+        dump_dataset_sample_path: "/media/cookie/WD6TB/Derpi/dataset_v5_sample"
+        size: 512
+        center_crop: true # false = stretch images
+        allow_rectangle_batches: true # use non-square images in batches
+        n_buckets: 32
+        variable_image_size: false # sometimes train on higher resolution images (keeping total pixel count the same by skipping some images)
+        max_image_squash: 0.0 # stretch/squash images
+        flip_p:      0.5 # chance to flip images
+        flip_text_p: 0.0 # chance to flip images with dialogue
+       #
+        tag_use_alias_prob: 0.4  # chance to use alternative tag names (e.g: 'pinkie' instead of 'pinkie pie')
+        human_caption_prob: 0.5  # chance to use human captions instead of tags, only works if image has human captions
+        tag_dropout_prob  : 0.0  # chance to drop non-essential tags
+        caption_drop_prob : 0.05 # chance to drop entire caption
+        shuffle_tags_prob : 0.2  # shuffle tags in caption
+    validation:
+      target: ldm.data.personalized.PersonalizedBase
+      params:
+        set: val
+        data_root     : "/media/cookie/WD6TB/Derpi/dataset_v5/val"
+        tagdata_path  : "/media/cookie/WD6TB/Derpi/Derpi/metadata/tagsdata.p"
+        scoreperc_path: "/media/cookie/SN850/derpy-score-predictor/data/scores_v3.json"
+        dump_dataset_sample_path: "/media/cookie/WD6TB/Derpi/dataset_v5_sample"
+        size: 512
+        repeats: 0.2
+        center_crop: true # false = stretch images
+        allow_rectangle_batches: true # use non-square images in batches
+        n_buckets: 32
+        variable_image_size: false # sometimes train on higher resolution images (keeping total pixel count the same by skipping some images)
+        max_image_squash: 0.0 # stretch/squash images
+        flip_p:      0.0 # chance to flip images
+        flip_text_p: 0.0 # chance to flip images with dialogue
+       #
+        tag_use_alias_prob: 0.4  # chance to use alternative tag names (e.g: 'pinkie' instead of 'pinkie pie')
+        human_caption_prob: 0.5  # chance to use human captions instead of tags, only works if image has human captions
+        tag_dropout_prob  : 0.0  # chance to drop non-essential tags
+        caption_drop_prob : 0.05 # chance to drop entire caption
+        shuffle_tags_prob : 0.2  # shuffle tags in caption
